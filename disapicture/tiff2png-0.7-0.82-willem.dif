@@ -1,0 +1,572 @@
+--- tiff2png-0.7/tiff2png.c	Thu Sep 16 10:26:39 1999
++++ tiff2png-0.82/tiff2png.c	Wed Jul 12 17:51:12 2000
+@@ -1,8 +1,8 @@
+ /*
+ ** tiff2png.c - converts a Tagged Image File to a Portable Network Graphics file
+ **
+-** Copyright (C) 1996 by Willem van Schaik, Singapore
+-**                       <gwillem@ntuvax.ntu.ac.sg>
++** Copyright (C) 1996 by Willem van Schaik, Calgary
++**                       <willem@schaik.com>
+ **
+ ** [see VERSION macro below for version and date]
+ **
+@@ -31,13 +31,15 @@
+ ** other special, indirect and consequential damages.
+ */
+ 
+-#define VERSION "0.7 of 16 September 1999"
++#define VERSION "0.82 of 12 July 2000"
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+ #include "tiff.h"
+ #include "tiffio.h"
++#include "tiffiop.h"
++#include "tiffconf.h"
+ #include "tiffcomp.h"
+ #include "png.h"
+ 
+@@ -64,6 +66,28 @@
+ typedef	unsigned long u_long;
+ */
+ 
++/* Correspondance between TIFF tags and PNG text chunks*/
++uint16 tifftag_comments[] = {
++    TIFFTAG_DOCUMENTNAME,
++        TIFFTAG_ARTIST,
++        TIFFTAG_IMAGEDESCRIPTION,
++        TIFFTAG_COPYRIGHT,
++        TIFFTAG_DATETIME,
++        TIFFTAG_SOFTWARE
++};
++
++char* png_keyComments[] = {
++    "Title",
++        "Author",
++        "Description",
++        "Copyright",
++        "Creation Time",
++        "Software"
++};
++
++#define NB_COMMENTS (sizeof(tifftag_comments) / sizeof(uint16))
++
++
+ typedef struct _jmpbuf_wrapper {
+   jmp_buf jmpbuf;
+ } jmpbuf_wrapper;
+@@ -73,40 +97,46 @@
+ /* macros to get and put bits out of the bytes */
+ 
+ #define GET_LINE \
+-  { \
++{ \
+     if (bitsleft == 0) \
+     { \
+       p_line++; \
+       bitsleft = 8; \
+     } \
+-    bitsleft -= bps; \
++    bitsleft -= (bps >= 8) ? 8 : bps; \
+     sample = (*p_line >> bitsleft) & maxval; \
+-  }
++    if (invert) \
++        sample = ~sample & maxval; \
++}
+ #define GET_STRIP \
+-  { \
++{ \
+     if (getbitsleft == 0) \
+     { \
+       p_strip++; \
+       getbitsleft = 8; \
+     } \
+-    getbitsleft -= bps; \
++    getbitsleft -= (bps >= 8) ? 8 : bps; \
+     sample = (*p_strip >> getbitsleft) & maxval; \
+-  }
++    if (invert) \
++        sample = ~sample & maxval; \
++}
+ #define PUT_LINE \
+-  { \
++{ \
+     if (putbitsleft == 0) \
+     { \
+       p_line++; \
+       putbitsleft = 8; \
+     } \
+-    putbitsleft -= bps; \
++    putbitsleft -= (bps >= 8) ? 8 : bps; \
++    if (invert) \
++        sample = ~sample; \
+     *p_line |= ((sample & maxval) << putbitsleft); \
+-  }
++}
+ 
+ /*----------------------------------------------------------------------------*/
+ 
+ static void usage (rc)
+-  int rc;
++int rc;
+ {
+   char *pTIFFver;
+   int len;
+@@ -130,7 +160,8 @@
+     ZLIB_VERSION, zlib_version);
+ 
+   fprintf (stderr,
+- "Usage: tiff2png [-verbose] [-gamma val] [-interlace] <tiff-file> <png-file>\n"
++        "Usage: tiff2png [-verbose] [-gamma val] [-interlace] [-invert]"
++        "[-image <num-image>] [-offset <offset-file>] <tiff-file> <png-file>\n"
+     );
+ 
+   fprintf (stderr,
+@@ -139,6 +170,12 @@
+     "   -gamma option writes PNG with specified gamma value (e.g., 0.45455)\n");
+   fprintf (stderr,
+     "   -interlace option writes interlaced PNG\n");
++    fprintf (stderr,
++        "   -invert images can be useful for black/white swapping\n");
++    fprintf (stderr,
++        "   -image <num-image> in a multi-page TIFF file, converts the <num_image> image\n");
++    fprintf (stderr,
++        "   -offset <offset-file> use the <offset-file> to know where the pages are\n");
+ #ifdef FAXPECT
+   fprintf (stderr,
+     "   -faxpect option converts 2:1 aspect-ratio faxes to square pixels\n");
+@@ -150,8 +187,8 @@
+ /*----------------------------------------------------------------------------*/
+ 
+ static void tiff2png_error_handler (png_ptr, msg)
+-  png_structp png_ptr;
+-  png_const_charp msg;
++png_structp png_ptr;
++png_const_charp msg;
+ {
+   jmpbuf_wrapper  *jmpbuf_ptr;
+ 
+@@ -182,23 +219,29 @@
+ 
+ int
+ main (argc, argv)
+-  int argc;
+-  char* argv[];
++int argc;
++char* argv[];
+ 
+ {
+   int argn;
+   int verbose = FALSE;
++    int invert = FALSE;
+ #ifdef FAXPECT
+   int faxpect = FALSE;
+ #endif
+ 
+-  register TIFF* tif;
+-  char name [256];
++//    register TIFF* tif;
++    TIFF* tif;
++    char name [1024];
+   u_short bps, spp, planar;
++    u_short byteorder;
+   u_short photometric;
+   int maxval;
+   int colors;
+-  int halfcols, cols, rows;
++    int cols, rows;
++#ifdef FAXPECT
++    int halfcols;
++#endif
+   int row;
+   register int col;
+   u_char* tiffstrip;
+@@ -210,6 +253,11 @@
+   register int getbitsleft;
+   register int putbitsleft;
+ 
++    uint16 num_image = 0;
++    int bWithOffset = 0;
++    FILE* fichierOffset = NULL;
++    uint32 offset;
++    
+   float xres, yres, ratio;			/* TIFF */
+   png_uint_32 res_x_half, res_x, res_y;		/* PNG */
+   int unit_type;
+@@ -233,17 +281,13 @@
+   int interlace_type = PNG_INTERLACE_NONE;
+   int pass;
+ 
+-  long i, j, b, n, s;
++    int index_comments;
++    png_text  text_ptr[NB_COMMENTS];
++    int  num_text = 0;
++    char *buffers[NB_COMMENTS];
+ 
+-  /* debug */
+ 
+-#ifdef OLD_LIBTIFF
+-  if (verbose)
+-    fprintf (stderr, "Tiff2png: Old libtiff (like v2.4) is used\n");
+-#else
+-  if (verbose)
+-    fprintf (stderr, "Tiff2png: New libtiff (like v3.4) is used\n");
+-#endif
++    long i, n, s;
+ 
+   /* get command-line arguments */
+ 
+@@ -263,8 +307,33 @@
+       else
+ 	usage (1);
+     }
+-    else if (strncmp (argv[argn], "-interlace", 2) == 0)
++        else if (strncmp (argv[argn], "-interlace", 4) == 0)
+       interlace_type = PNG_INTERLACE_ADAM7;
++        else if (strncmp (argv[argn], "-invert", 4) == 0)
++            invert = TRUE;
++        else if (strncmp (argv[argn], "-image", 3) == 0) 
++        {
++            if (++argn < argc)
++                sscanf (argv[argn], "%d", &num_image);
++            else
++                usage (1);
++        }
++        else if (strncmp (argv[argn], "-offset", 2) == 0) 
++        {
++            if (++argn < argc)
++            {
++                fichierOffset = fopen(argv[argn], "rb");
++                if (fichierOffset == NULL) {
++                    bWithOffset = 0;
++                    if (verbose) fprintf (stderr, "ERREUR : no offset file %s!!!\n", argv[argn]);
++                } else {
++                    bWithOffset = 1;
++                }
++            }
++            else
++                usage (1);
++        }
++        
+ #ifdef FAXPECT
+     else if (strncmp (argv[argn], "-faxpect", 2) == 0)
+       faxpect = TRUE;
+@@ -276,7 +345,7 @@
+ 
+   if (argn != argc)
+   {
+-    tif = TIFFOpen (argv[argn], "r");
++        tif = TIFFOpen (argv[argn], "ru");
+     strcpy (name, argv[argn]);
+     if (verbose)
+       fprintf (stderr, "Tiff2png: %s\n", name);
+@@ -306,11 +375,47 @@
+   if (argn != argc)
+     usage (1);
+ 
++    /* Go to the image-num specified */
++    if (bWithOffset) {
++        if (fseek(fichierOffset, (num_image) * sizeof(uint32), 0) == -1) {  /* depuis le début */
++            /* Probleme lors du seek */
++            fprintf (stderr, "Tiff2png error: unable to read offset-file\n");
++            exit (10);
++        }
++        if (fread(&offset, sizeof(uint32), 1, fichierOffset) == 0) {
++            /* Probleme lors de la lecture de l'offset */
++            fprintf (stderr, "Tiff2png error: read error on offset-file\n");
++            exit (10);
++        }
++        if (!TIFFSetSubDirectory(tif, offset))  {
++            /* Probleme lors de l'arrivee sur le Directory*/
++            fprintf (stderr, "Tiff2png error: directory %d in TIFF file doesn't exist\n", num_image);
++            exit (11);
++        }			
++        
++    } else {
++        if (!TIFFSetDirectory(tif, (uint16)(num_image)))  { /* les directories sont comptes a partir de 0 */
++            /* Probleme lors de l'arrivee sur le Directory*/
++            fprintf (stderr, "Tiff2png error: directory %d in TIFF file doesn't exist\n", num_image);
++            exit (11);
++        }
++    }
++    
++    if (bWithOffset) {
++        fclose(fichierOffset);
++    }
++    
++    if (verbose) 
++        fprintf (stderr, "TIFF file at directory %d \n", num_image);
++    
++    
+   /* get TIFF header info */
+ 
+   if (verbose)
+     TIFFPrintDirectory (tif, stderr, TIFFPRINT_NONE);
+ 
++    byteorder = tif->tif_header.tiff_magic;
++
+   if (! TIFFGetField (tif, TIFFTAG_PHOTOMETRIC, &photometric))
+   {
+     fprintf (stderr, "Error: photometric could not be retrieved\n");
+@@ -372,7 +477,7 @@
+         res_y = (png_uint_32)(39.37*yres + 0.5);
+         unit_type = PNG_RESOLUTION_METER;
+         break;
+-/*    case RESUNIT_NONE:   */
++            /*    case RESUNIT_NONE:   */
+       default:
+         res_x_half = (png_uint_32)(50.0*xres + 0.5);
+         res_x = (png_uint_32)(100.0*xres + 0.5);
+@@ -399,8 +504,9 @@
+ 
+   /* start PNG preparation */
+ 
+-  png_ptr = png_create_write_struct (PNG_LIBPNG_VER_STRING,
+-    &tiff2png_jmpbuf_struct, tiff2png_error_handler, NULL);
++    png_ptr = png_create_write_struct (PNG_LIBPNG_VER_STRING, &tiff2png_jmpbuf_struct, 
++        (png_voidp) tiff2png_error_handler, NULL);
++
+   if (!png_ptr)
+   {
+     fprintf (stderr, "Tiff2png error: cannot allocate libpng main struct\n");
+@@ -436,10 +542,12 @@
+     case PHOTOMETRIC_MINISBLACK:
+     case PHOTOMETRIC_MINISWHITE:
+       if (verbose)
++        {
+ 	if (photometric == PHOTOMETRIC_MINISBLACK)
+ 	  fprintf (stderr, "Tiff2png: %d graylevels (min=black)\n", maxval + 1);
+ 	else
+ 	  fprintf (stderr, "Tiff2png: %d graylevels (min=white)\n", maxval + 1);
++        }
+       if (spp == 1) /* no alpha */
+       {
+ 	color_type = PNG_COLOR_TYPE_GRAY;
+@@ -487,10 +595,23 @@
+       /* TIFF palettes contain 16-bit shorts, while PNG palettes are 8-bit) */
+       for (i = 0 ; i < colors ; i++)
+       {
++                if (!invert)
++                {
+ 	palette[i].red   = (png_byte) (redcolormap[i] >> 8);
+ 	palette[i].green = (png_byte) (greencolormap[i] >> 8);
+ 	palette[i].blue  = (png_byte) (bluecolormap[i] >> 8);
+       }
++                else
++                {
++                    palette[i].red   = ~((png_byte) (redcolormap[i] >> 8));
++                    palette[i].green = ~((png_byte) (greencolormap[i] >> 8));
++                    palette[i].blue  = ~((png_byte) (bluecolormap[i] >> 8));
++                }
++            }
++
++            // now we must prevent that the bitmap itself gets inverted
++            invert = FALSE;
++
+       break;
+     }
+ 
+@@ -572,6 +693,27 @@
+   if (color_type == PNG_COLOR_TYPE_PALETTE)
+     png_set_PLTE(png_ptr, info_ptr, palette, colors);
+ 
++    /* On recopie les commentaires */
++    num_text = 0;  
++    for (index_comments = 0; index_comments < NB_COMMENTS; index_comments++) {
++        if (TIFFGetField (tif, tifftag_comments[index_comments], &buffers[num_text])) {
++            if (verbose) {
++                fprintf(stderr, "Read %s for chunnk %s (%d/%d)\n", buffers[num_text], 
++                    png_keyComments[index_comments], index_comments, num_text);
++            }
++            
++            text_ptr[num_text].key = png_keyComments[index_comments];
++            text_ptr[num_text].text = buffers[num_text];
++            text_ptr[num_text].compression  = PNG_TEXT_COMPRESSION_NONE;
++            ++num_text;
++        } else {
++            /* free(buffers[num_text]); */
++        }
++        
++    }
++    png_set_text(png_ptr, info_ptr, text_ptr, num_text);
++    
++    
+   /* gAMA chunk */
+   if (gamma != -1.0)
+   {
+@@ -638,7 +780,7 @@
+           p_line = tiffline;
+           putbitsleft = 8;
+ 
+-	  if (TIFFReadScanline(tif, tiffstrip, row, s) < 0)
++                    if (TIFFReadScanline (tif, tiffstrip, row, (tsample_t) s) < 0)
+ 	  {
+ 	    fprintf (stderr, "Error: bad data read on line %d\n", row);
+ 	    exit (1);
+@@ -673,26 +815,45 @@
+             switch (bps)
+ 	    {
+               case 16:
+-#ifdef OLD_LIBTIFF
+ 		if (photometric == PHOTOMETRIC_MINISWHITE)
+ 		{
++                            if (byteorder == TIFF_BIGENDIAN)
++                            {
+ 		  GET_LINE
+ 		  sample16 = sample;
+ 		  sample16 <<= 8;
+ 		  GET_LINE
+ 		  sample16 |= sample;
++                            }
++                            else
++                            {
++                                GET_LINE
++                                    sample16 = sample;
++                                GET_LINE
++                                    sample16 |= (sample << 8);
++                            }
+ 		  sample16 = maxval - sample16;
+ 		  *p_png++ = (u_char)((sample16 >> 8) & 0x0F);
+ 	  	  *p_png++ = (u_char)(sample16 & 0x0F);
+ 		}
+-		else
+-#endif
++                        else // MINISBLACK
++                        {
++                            if (byteorder == TIFF_BIGENDIAN)
+ 		{
+ 		  GET_LINE
+ 		  *p_png++ = sample;
+ 		  GET_LINE
+ 		  *p_png++ = sample;
+ 		}
++                            else
++                            {
++                                GET_LINE
++                                    *(p_png + 1) = sample;
++                                GET_LINE
++                                    *p_png = sample;
++                                p_png += 2;
++                            }
++                        }
+ 		break;
+ 
+               case 8:
+@@ -700,10 +861,8 @@
+               case 2:
+               case 1:
+ 		GET_LINE
+-#ifdef OLD_LIBTIFF
+ 		if (photometric == PHOTOMETRIC_MINISWHITE)
+ 		  sample = maxval - sample;
+-#endif
+ 	        *p_png++ = sample;
+ 		break;
+ 
+@@ -735,61 +894,72 @@
+               switch (bps)
+ 	      {
+                 case 16:
+-#ifdef OLD_LIBTIFF
+ 		  if (photometric == PHOTOMETRIC_MINISWHITE && i == 0)
+ 		  {
++                                        if (byteorder == TIFF_BIGENDIAN)
++                                        {
+ 		    GET_LINE
+ 		    sample16 = sample;
+ 		    sample16 <<= 8;
+ 		    GET_LINE
+ 		    sample16 |= sample;
++                                        }
++                                        else
++                                        {
++                                            GET_LINE
++                                                sample16 = sample;
++                                            GET_LINE
++                                                sample16 |= (sample << 8);
++                                        }
+ 		    sample16 = maxval - sample16;
+ 		    *p_png++ = (u_char)((sample16 >> 8) & 0x0F);
+ 	  	    *p_png++ = (u_char)(sample16 & 0x0F);
+ 		  }
+ 		  else
+-#endif
++                                    {
++                                        if (byteorder == TIFF_BIGENDIAN)
+ 		  {
+ 		    GET_LINE
+ 		    *p_png++ = sample;
+ 		    GET_LINE
+ 		    *p_png++ = sample;
+ 		  }
++                                        else
++                                        {
++                                            GET_LINE
++                                                *(p_png + 1) = sample;
++                                            GET_LINE
++                                                *p_png = sample;
++                                            p_png += 2;
++                                        }
++                                    }
+ 		  break;
+ 
+                 case 8:
+ 		  GET_LINE
+-#ifdef OLD_LIBTIFF
+ 		  if (photometric == PHOTOMETRIC_MINISWHITE && i == 0)
+ 		    sample = maxval - sample;
+-#endif
+ 	          *p_png++ = sample;
+ 		  break;
+ 
+                 case 4:
+ 		  GET_LINE
+-#ifdef OLD_LIBTIFF
+ 		  if (photometric == PHOTOMETRIC_MINISWHITE && i == 0)
+ 		    sample = maxval - sample;
+-#endif
+ 	          *p_png++ = sample * 16;
+ 		  break;
+ 
+                 case 2:
+ 		  GET_LINE
+-#ifdef OLD_LIBTIFF
+ 		  if (photometric == PHOTOMETRIC_MINISWHITE && i == 0)
+ 		    sample = maxval - sample;
+-#endif
+ 	          *p_png++ = sample * 64;
+ 		  break;
+ 
+                 case 1:
+ 		  GET_LINE
+-#ifdef OLD_LIBTIFF
+ 		  if (photometric == PHOTOMETRIC_MINISWHITE && i == 0)
+ 		    sample = maxval - sample;
+-#endif
+ 	          *p_png++ = sample * 128;
+ 		  break;
+ 
+@@ -808,10 +978,21 @@
+               switch (bps)
+ 	      {
+                 case 16:
++                                    if (byteorder == TIFF_BIGENDIAN)
++                                    {
+ 		  GET_LINE
+ 		  *p_png++ = sample;
+ 		  GET_LINE
+ 		  *p_png++ = sample;
++                                    }
++                                    else
++                                    {
++                                        GET_LINE
++                                            *(p_png + 1) = sample;
++                                        GET_LINE
++                                            *p_png = sample;
++                                        p_png += 2;
++                                    }
+ 		  break;
+ 
+                 case 8:

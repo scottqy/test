@@ -1,0 +1,17 @@
+env=Environment(
+	CC='/opt/stbgcc/bin/mipsel-linux-g++',
+	CXX='/opt/stbgcc/bin/mipsel-linux-g++',
+	CCFLAGS='-g -O2 -DDEBUG_7231 -DGNU -DOPENGL_ES',
+	CPPPATH = ['/home/myb/sc7231v/usr/include', 
+	'/home/myb/sc7231v/usr/include/cloud', 
+	'/home/myb/sc7231v/usr/include/freetype2',
+	'/home/myb/sc7231v/usr/include/ktvenv'])
+	
+lib_files = Split('b_os rt settop nxpl nexus v3ddriver qrencode png z pthread cloud dl m rbd rx2d rt jpeg png picasso freetype iconv rxinput ktvenv database r3d settop sqlite3 d3des gif')
+
+
+app_files = 'main.cpp'
+ktvc=env.Program('ktvc',app_files,LIBS=lib_files,LIBPATH='/home/myb/sc7231v/usr/lib')
+
+
+
