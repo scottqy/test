@@ -1,3 +1,4 @@
+env_path='usr-gz'
 env=Environment(
 	CC='/opt/stbgcc/bin/mipsel-linux-g++',
 	CXX='/opt/stbgcc/bin/mipsel-linux-g++',
